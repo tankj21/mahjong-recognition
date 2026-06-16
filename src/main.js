@@ -79,7 +79,7 @@ const el = {
 // 1. 麻雀牌の動的ベクター描画エンジン
 // ==========================================
 
-function drawTileFace(ctx, tileCode, w, h) {
+function drawTileFace(ctx, tileCode, w, h, isTemplate = false) {
   const scaleX = w / 32;
   const scaleY = h / 48;
   const s = Math.min(scaleX, scaleY);
@@ -91,10 +91,12 @@ function drawTileFace(ctx, tileCode, w, h) {
   ctx.fillStyle = grad;
   ctx.fillRect(0, 0, w, h);
   
-  // 内側の面取り線（ベゼル）
-  ctx.strokeStyle = '#e5e7eb';
-  ctx.lineWidth = 1 * s;
-  ctx.strokeRect(1.5 * s, 1.5 * s, w - 3 * s, h - 3 * s);
+  // テンプレート作成時は、枠線のエッジノイズを防ぐためベゼルを描画しない
+  if (!isTemplate) {
+    ctx.strokeStyle = '#e5e7eb';
+    ctx.lineWidth = 1 * s;
+    ctx.strokeRect(1.5 * s, 1.5 * s, w - 3 * s, h - 3 * s);
+  }
   
   if (!tileCode) return;
   
@@ -469,13 +471,37 @@ function initTemplates() {
   
   for (const code of TILE_CODES) {
     ctx.clearRect(0, 0, 32, 48);
-    drawTileFace(ctx, code, 32, 48);
+    drawTileFace(ctx, code, 32, 48, true); // isTemplate = true を指定して境界ベゼルを除去
     
     const imgData = ctx.getImageData(0, 0, 32, 48);
     const gray = convertToGrayscale(imgData);
     const edges = getSobelEdges(gray, 32, 48);
     state.templates[code] = edges;
   }
+}
+
+// コントラスト正規化（Min-Max輝度ストレッチによる影・照度対策）
+function normalizeContrast(gray, w, h) {
+  let min = 255;
+  let max = 0;
+  // 外周3pxを除いた内側部分の最小・最大輝度値を取得（境界ノイズ軽減のため）
+  for (let y = 3; y < h - 3; y++) {
+    for (let x = 3; x < w - 3; x++) {
+      const val = gray[y * w + x];
+      if (val < min) min = val;
+      if (val > max) max = val;
+    }
+  }
+  
+  const range = max - min;
+  if (range <= 10) return gray; // コントラスト差が極端に低い場合はそのまま返す
+  
+  const normalized = new Float32Array(gray.length);
+  for (let i = 0; i < gray.length; i++) {
+    const val = ((gray[i] - min) / range) * 255;
+    normalized[i] = Math.max(0, Math.min(255, val));
+  }
+  return normalized;
 }
 
 // シフトした座標から安全にピクセルデータを取得
@@ -488,43 +514,59 @@ function getShiftedPixel(pixels, w, h, x, y, dx, dy) {
   return 0; // 範囲外はゼロパディング
 }
 
-// ゼロ平均正規化相互相関 (ZNCC) スライディングマッチング
+// ゼロ平均正規化相互相関 (ZNCC) スライディングマッチング (境界ノイズを除いた内側70%のみで判定)
 function matchZNCC(cropEdges, w, h, templateEdges, tw, th) {
   let maxScore = -1;
   
-  // テンプレート側の事前集計
+  // 内側領域の定義 (左右5px, 上下7pxのマージンを除外)
+  const marginX = 5;
+  const marginY = 7;
+  const innerW = tw - 2 * marginX; // 22
+  const innerH = th - 2 * marginY; // 34
+  const innerSize = innerW * innerH;
+  
+  // テンプレート側の事前集計（内側部分のみ）
   let sumT = 0;
-  for (let i = 0; i < templateEdges.length; i++) {
-    sumT += templateEdges[i];
+  for (let y = marginY; y < th - marginY; y++) {
+    for (let x = marginX; x < tw - marginX; x++) {
+      sumT += templateEdges[y * tw + x];
+    }
   }
-  const meanT = sumT / templateEdges.length;
+  const meanT = sumT / innerSize;
   
   let varT = 0;
-  for (let i = 0; i < templateEdges.length; i++) {
-    const diff = templateEdges[i] - meanT;
-    varT += diff * diff;
+  for (let y = marginY; y < th - marginY; y++) {
+    for (let x = marginX; x < tw - marginX; x++) {
+      const diff = templateEdges[y * tw + x] - meanT;
+      varT += diff * diff;
+    }
   }
   if (varT === 0) varT = 1;
   
-  // 位置ズレ許容範囲 (左右2px, 上下3px) でスライドサーチ
-  for (let dy = -3; dy <= 3; dy++) {
-    for (let dx = -2; dx <= 2; dx++) {
-      const shiftedCrop = new Float32Array(tw * th);
+  // 位置ズレ許容範囲 (左右3px, 上下4px) でスライドサーチ
+  for (let dy = -4; dy <= 4; dy++) {
+    for (let dx = -3; dx <= 3; dx++) {
+      const shiftedCrop = new Float32Array(innerSize);
       let sumC = 0;
-      for (let y = 0; y < th; y++) {
-        for (let x = 0; x < tw; x++) {
+      
+      let idx = 0;
+      for (let y = marginY; y < th - marginY; y++) {
+        for (let x = marginX; x < tw - marginX; x++) {
           const val = getShiftedPixel(cropEdges, w, h, x, y, dx, dy);
-          shiftedCrop[y * tw + x] = val;
+          shiftedCrop[idx++] = val;
           sumC += val;
         }
       }
       
-      const meanC = sumC / shiftedCrop.length;
+      const meanC = sumC / innerSize;
       let num = 0;
       let varC = 0;
-      for (let i = 0; i < shiftedCrop.length; i++) {
+      
+      for (let i = 0; i < innerSize; i++) {
         const diffC = shiftedCrop[i] - meanC;
-        const diffT = templateEdges[i] - meanT;
+        const tx = marginX + (i % innerW);
+        const ty = marginY + Math.floor(i / innerW);
+        const diffT = templateEdges[ty * tw + tx] - meanT;
         num += diffC * diffT;
         varC += diffC * diffC;
       }
@@ -553,7 +595,10 @@ function classifyTile(cropCtx, cropW, cropH) {
   
   const resizedData = resizeCtx.getImageData(0, 0, 32, 48);
   const gray = convertToGrayscale(resizedData);
-  const edges = getSobelEdges(gray, 32, 48);
+  
+  // コントラストの輝度正規化を追加
+  const normalizedGray = normalizeContrast(gray, 32, 48);
+  const edges = getSobelEdges(normalizedGray, 32, 48);
   
   let bestCode = '1m';
   let bestScore = -2;
